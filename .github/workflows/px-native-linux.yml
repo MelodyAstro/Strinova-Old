@@ -1,0 +1,326 @@
+name: Strinova Native Linux
+# Triggered on main base updates and manual dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tools_only:
+        description: Warm or verify compiled tools without rebuilding the server
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/px-native-linux.yml'
+      - 'px/ops/package-ci-native.py'
+      - 'px/ops/ci-tools-cache.py'
+      - 'backend/**'
+      - 'frontend/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'bun.lock'
+      - 'package.json'
+      - 'patches/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: px-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: '1.99.1'
+  BUN_VERSION: '1.4.2'
+  STRAVIA_PLATFORM_PLUGIN_FIXTURE: ${{ github.workspace }}/target/wasm32-wasip2/release/stravia_platform_plugin_example.wasm
+
+jobs:
+  build:
+    name: Test and build native GNU package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: strinova_test
+          POSTGRES_PASSWORD: isolated_ci_fixture
+          POSTGRES_DB: strinova_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U strinova_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DB_URL: postgresql://strinova_test:isolated_ci_fixture@127.0.0.1:5432/strinova_test
+      STRAVIA_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - name: Reserve space for workspace cache archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h .
+          # This disposable Linux runner builds Rust/Wasm and WebUI only.
+          # Leave enough space for both target outputs and the cache archive.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet
+          df -h .
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout private Strinova host patch
+        uses: actions/checkout@v6
+        with:
+          repository: MelodyAstro/Strinova
+          ref: main
+          token: ${{ secrets.STRINOVA_PRIVATE_TOKEN }}
+          path: .strinova-patch
+          persist-credentials: false
+
+      - name: Apply private Strinova host patch
+        run: python3 .strinova-patch/scripts/apply-patch.py --source "$GITHUB_WORKSPACE"
+
+      - name: Checkout private vendor patch
+        uses: actions/checkout@v6
+        with:
+          repository: MelodyAstro/Strinova
+          ref: private/vendor-plugins
+          token: ${{ secrets.STRINOVA_PRIVATE_TOKEN }}
+          path: .strinova-vendor-patch
+          persist-credentials: false
+
+      - name: Apply private vendor patch
+        run: python3 .strinova-vendor-patch/scripts/apply-patch.py --source "$GITHUB_WORKSPACE" --vendor
+
+      - name: Verify complete source patch before compilation
+        if: inputs.tools_only != true
+        run: |
+          python3 px/ops/test-package-ci-native.py
+          python3 px/ops/test-deploy-platform-plugins.py
+          python3 px/ops/package-ci-native.py --verify-source-only
+
+      - name: Install native build dependencies
+        run: bash px/ops/ci-native-deps.sh
+
+      - name: Set up pinned Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          target: wasm32-wasip2
+          components: rustfmt
+          cache: false
+
+      - name: Restore shared Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: px-native-linux-gnu-v1
+          cache-targets: 'true'
+          cache-all-crates: 'true'
+          cache-on-failure: 'true'
+          cache-bin: 'true'
+          save-if: 'false'
+
+      # Reuse the exact backend-source cache verified by Platform Plugins.
+      # Cargo still validates the feature/profile graph before reusing outputs.
+      - name: Cache platform workspace compilation
+        id: workspace-cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: strinova-platform-workspace-v075
+          cache-targets: 'true'
+          cache-all-crates: 'true'
+          cache-workspace-crates: 'true'
+          cache-on-failure: 'true'
+          cache-bin: 'true'
+
+      - name: Restore pinned compiled patch manager
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cargo/bin/cargo-patch-crate
+          key: patch-crate-0.1.13-${{ runner.os }}-${{ runner.arch }}-rust-1.99.1
+
+      - name: Restore evolving compiled workspace
+        id: evolving-workspace
+        uses: actions/cache/restore@v5
+        with:
+          key: strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
+          path: target
+
+      - name: Set up pinned Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+        with:
+          version: '3.52.0'
+
+      - name: Restore compiled tools and vendor components
+        id: compiled-tools
+        uses: actions/cache/restore@v5
+        with:
+          # Test-only edits reuse deployable guests; current native tests still run below.
+          key: px-tools-v1-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('.github/workflows/px-native-linux.yml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'patches/**', '.cargo/config.toml', 'backend/crates/stravia-vendor-*/**', 'backend/crates/stravia-runtime-contract/**', 'backend/crates/stravia-protocol-codec/**', 'backend/crates/stravia-core/assets/providers.stravia.json', 'frontend/stravia-webui/src/assets/icons/*.svg', 'px/ops/ci-tools-cache.py', '!backend/crates/stravia-vendor-*/tests/**') }}
+          path: |
+            target/debug/stravia-build-vendors
+            target/vendor-plugins
+            target/wasm32-wasip2/release/stravia_vendor_codex.wasm
+            target/wasm32-wasip2/release/stravia_vendor_antigravity.wasm
+            target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm
+            target/px-tools-cache.json
+
+      - name: Prepare patched upstream dependencies
+        run: task prepare:crates
+
+      - name: Verify cached binaries
+        if: steps.compiled-tools.outputs.cache-hit == 'true'
+        run: python3 px/ops/ci-tools-cache.py verify
+
+      - name: Build WebUI
+        if: inputs.tools_only != true
+        run: task build:web
+
+      - name: Build embedded provider and its build tool
+        if: steps.compiled-tools.outputs.cache-hit != 'true'
+        run: task build:vendors
+
+      - name: Build managed compatibility components
+        if: steps.compiled-tools.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --lib --target wasm32-wasip2 -p stravia-vendor-codex -p stravia-vendor-antigravity -p stravia-vendor-claudecode
+
+      - name: Record compiled binary checksums
+        if: steps.compiled-tools.outputs.cache-hit != 'true'
+        run: python3 px/ops/ci-tools-cache.py record
+
+      # Save successful compilation before running tests. A later test failure
+      # must not force compilation of the same tools again; tests always rerun.
+      - name: Save compiled tools and vendor components
+        if: steps.compiled-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.compiled-tools.outputs.cache-primary-key }}
+          path: |
+            target/debug/stravia-build-vendors
+            target/vendor-plugins
+            target/wasm32-wasip2/release/stravia_vendor_codex.wasm
+            target/wasm32-wasip2/release/stravia_vendor_antigravity.wasm
+            target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm
+            target/px-tools-cache.json
+
+      - name: Build installable platform plugin example
+        if: inputs.tools_only != true
+        run: |
+          task build:platform-plugin-example
+          cargo build --locked --release --lib --target wasm32-wasip2 -p strinova-model-mapping
+          cargo test --locked --release -p strinova-model-mapping --lib
+
+      - name: Verify platform plugin SDK and sandbox
+        if: inputs.tools_only != true
+        run: cargo test --locked --release -p stravia-platform-plugin-sdk -p stravia-platform-plugin-runtime --lib
+
+      - name: Verify protocol regressions
+        if: inputs.tools_only != true
+        run: cargo test --locked --release -p stravia-protocol-codec --lib
+
+      - name: Verify outbound identity and TLS regressions
+        if: inputs.tools_only != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release -p stravia-vendor-sdk --lib
+          cargo test --locked --release -p stravia-vendor-common --lib identity::tests
+          cargo test --locked --release -p stravia-vendor-codex -p stravia-vendor-claudecode -p stravia-vendor-antigravity --lib
+          STRAVIA_CODEX_WASM="$PWD/target/wasm32-wasip2/release/stravia_vendor_codex.wasm" STRAVIA_ANTIGRAVITY_WASM="$PWD/target/wasm32-wasip2/release/stravia_vendor_antigravity.wasm" cargo test --locked --release -p stravia-vendor-claudecode --test contract credential_import -- --ignored
+          STRAVIA_CLAUDECODE_WASM="$PWD/target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm" cargo test --locked --release -p stravia-vendor-claudecode --test contract official_identity_sync -- --ignored
+          STRAVIA_CLAUDECODE_WASM="$PWD/target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm" cargo test --locked --release -p stravia-vendor-claudecode --test contract allowance_read_queries_reset_status_without_consuming
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib plugin::network::shape -- --test-threads=1
+
+      - name: Verify Core plugin lifecycle and compatibility regressions
+        if: inputs.tools_only != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib custom_tool -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib request_models -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib platform_plugins -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib account_usage -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib account_usage_postgres -- --ignored --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib account_spend_limit -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib credential_import -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib proxy::ingress::open_responses::websocket::tests::official_steer_input_array_is_preserved -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib proxy::ingress::open_responses::websocket::tests::continuation_input_object_is_wrapped_as_a_responses_item_list -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib proxy::ingress::open_responses::websocket::tests::nested_steer_envelope_is_flattened_before_dispatch -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib proxy::dispatcher::inference_run::engine::completion::tests::canonical_gateway_ids_keep_provider_identity_for_encrypted_reasoning -- --test-threads=1
+
+      - name: Verify authenticated platform plugin management
+        if: inputs.tools_only != true
+        run: cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-server --no-default-features --lib platform_plugins -- --test-threads=1
+
+      - name: Verify authenticated account controls
+        if: inputs.tools_only != true
+        run: cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-server --no-default-features --lib account_controls -- --test-threads=1
+
+      - name: Set up cached Python test dependencies
+        if: inputs.tools_only != true
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Verify real SQLite and PostgreSQL upgrades over HTTP
+        if: inputs.tools_only != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-server --no-default-features --features test-harness --bin stravia-server --bin stravia-storage-test-harness
+          STRAVIA_BINARY="$PWD/target/release/stravia-server" STRAVIA_STORAGE_HARNESS_BINARY="$PWD/target/release/stravia-storage-test-harness" uv run --locked --group test python -m pytest tests/e2e/storage/test_shared_content_upgrade.py -q --durations=0
+
+      - name: Build optimized native server
+        if: inputs.tools_only != true
+        run: cargo build --locked --release -p stravia-server --bin stravia-server
+
+      - name: Verify packaged executable
+        if: inputs.tools_only != true
+        run: target/release/stravia-server --version
+
+      - name: Package source-bound host and components
+        if: inputs.tools_only != true
+        shell: bash
+        run: |
+          export STRINOVA_HOST_PATCH_REV="$(git -C .strinova-patch rev-parse HEAD 2>/dev/null || true)"
+          export STRINOVA_VENDOR_PATCH_REV="$(git -C .strinova-vendor-patch rev-parse HEAD 2>/dev/null || true)"
+          python3 px/ops/package-ci-native.py
+          python3 px/ops/export-plugin-patches.py
+
+      - name: Verify compiled-tool cache checkpoint
+        run: python3 px/ops/ci-tools-cache.py verify
+
+      - name: Upload native package
+        if: inputs.tools_only != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: strinova-linux-x86_64-gnu-${{ github.sha }}
+          path: dist/px-native/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Save compiled workspace after checks or failure
+        if: always() && steps.evolving-workspace.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ github.sha }}
+          path: target

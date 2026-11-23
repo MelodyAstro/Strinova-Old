@@ -1,0 +1,79 @@
+name: Strinova native release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Strinova Native Linux run for the current main commit
+        required: true
+        type: string
+  workflow_run:
+    workflows: [Strinova Native Linux]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: strinova-native-release-v0.7.5-patch
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'MelodyAstro/Strinova-Old' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_sha == github.sha))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout private Strinova host patch
+        uses: actions/checkout@v4
+        with:
+          repository: MelodyAstro/Strinova
+          ref: main
+          token: ${{ secrets.STRINOVA_PRIVATE_TOKEN }}
+          path: .strinova-patch
+          persist-credentials: false
+      - name: Apply private Strinova host patch
+        run: python3 .strinova-patch/scripts/apply-patch.py --source "$GITHUB_WORKSPACE"
+      - name: Checkout private vendor patch
+        uses: actions/checkout@v4
+        with:
+          repository: MelodyAstro/Strinova
+          ref: private/vendor-plugins
+          token: ${{ secrets.STRINOVA_PRIVATE_TOKEN }}
+          path: .strinova-vendor-patch
+          persist-credentials: false
+      - name: Apply private vendor patch
+        run: python3 .strinova-vendor-patch/scripts/apply-patch.py --source "$GITHUB_WORKSPACE" --vendor
+      - name: Verify tested source and artifact provenance
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          python3 px/ops/check-public-source.py
+          python3 px/ops/publish-native-release.py --verify-run
+      - uses: actions/download-artifact@v4
+        with:
+          name: strinova-linux-x86_64-gnu-${{ github.sha }}
+          path: release-input
+          run-id: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify checksums and prepare independent components
+        run: |
+          python3 -m unittest discover -s px/ops -p 'test_publish_native_release.py'
+          python3 px/ops/publish-native-release.py --artifact-dir release-input --output-dir release-assets
+      - name: Publish tested native release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 px/ops/publish-native-release.py --output-dir release-assets --publish
