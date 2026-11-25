@@ -511,6 +511,28 @@ impl GenerationChain {
         }
     }
 
+    pub(crate) fn from_sql_turn_chain(
+        sql_turn_chain: Arc<crate::turn_chain::SqlTurnChainStore>,
+        artifacts: Option<Arc<dyn stravia_runtime_contract::artifact::ArtifactStore>>,
+        runtime_cache: RuntimeCache,
+        retention: crate::history_retention::HistoryRetention,
+    ) -> Self {
+        Self {
+            store: GenerationChainStore::from_sql_turn_chain(
+                sql_turn_chain,
+                runtime_cache,
+                retention,
+            ),
+            pending_commits: PendingGenerationCommits::default(),
+            artifacts,
+            history_markers: None,
+            records_redaction_references: false,
+            compaction: None,
+            prompt_admissions: None,
+            atomic_state: None,
+        }
+    }
+
     pub(crate) fn with_prompt_admissions(
         mut self,
         store: Arc<dyn crate::storage::PromptAdmissionStore>,
@@ -1526,7 +1548,7 @@ struct ClientHistoryState {
 
 /// Namespace generation stamped on stored reusable prefixes. Bumping the
 /// version makes every older index stale at startup rebuild.
-const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v5:";
+const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v6:";
 
 impl ClientHistoryState {
     fn heap_bytes(&self) -> usize {
@@ -1718,9 +1740,7 @@ impl EffectiveRequestConfig {
         if !request.parameters.resets(ParameterReset::ParallelToolCalls) {
             inherit_option(&mut request.parallel_tool_calls, &self.parallel_tool_calls);
         }
-        if request.reasoning.budget_tokens.is_none()
-            && request.reasoning.level.is_none()
-            && request.reasoning.mode.is_none()
+        if request.reasoning.level.is_none()
             && request.reasoning.summary.is_none()
             && request.reasoning.target_control.is_none()
             && !request.parameters.resets(ParameterReset::Reasoning)

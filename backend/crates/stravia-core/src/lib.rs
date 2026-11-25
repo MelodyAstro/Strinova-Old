@@ -27,7 +27,9 @@ pub mod migrations;
 pub(crate) mod model_turn;
 pub mod outbound_proxy;
 pub mod performance;
+pub mod platform_llm;
 pub mod plugin;
+pub mod policy;
 pub mod pricing;
 pub mod protocol;
 pub mod provider_catalog;
@@ -52,5 +54,8 @@ pub mod turn_chain;
 pub(crate) mod web_access;
 pub(crate) mod web_search;
 
-pub use gateway::{Gateway, GatewayBuilder, PreparedGateway, RuntimeStorageKind};
+pub use gateway::{
+    Gateway, GatewayBuilder, GatewayExtensionFactory, GatewayExtensions, PreparedGateway,
+    RuntimeStorageKind,
+};
 pub(crate) use tool_execution::{PreparedMarkerExecution, StartedMarkerDelivery};

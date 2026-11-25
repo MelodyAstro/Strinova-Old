@@ -76,6 +76,40 @@ async fn ticket(observation: &InteractionObservation) -> anyhow::Result<Download
         .await
 }
 
+#[tokio::test(start_paused = true)]
+async fn bundle_tickets_are_single_use_and_expire() -> anyhow::Result<()> {
+    // Set up the SQLite fixture with its normal I/O timeouts.
+    tokio::time::resume();
+    let (_directory, _pool, observation) = fixture().await?;
+    let run = admit(&observation, "ticket-run", None);
+    finish(&run, "completed", Some("root-generation"));
+    let valid = ticket(&observation).await?;
+    let expiring = ticket(&observation).await?;
+    tokio::time::pause();
+
+    let valid_token = valid.download_url.rsplit('/').next().expect("ticket token");
+    let expiring_token = expiring
+        .download_url
+        .rsplit('/')
+        .next()
+        .expect("ticket token");
+    drop(observation.consume_bundle_ticket(valid_token).await?);
+    assert!(matches!(
+        observation.consume_bundle_ticket(valid_token).await,
+        Err(error) if error.is::<super::TicketUnavailable>()
+    ));
+
+    tokio::time::advance(super::TICKET_TTL).await;
+    let unknown_token = "0".repeat(64);
+    for token in [expiring_token, unknown_token.as_str()] {
+        assert!(matches!(
+            observation.consume_bundle_ticket(token).await,
+            Err(error) if error.is::<super::TicketUnavailable>()
+        ));
+    }
+    Ok(())
+}
+
 /// 带新用户输入、生成父节点为 `generation_parent` 的请求。
 fn admit_user_turn(
     observation: &InteractionObservation,
@@ -230,15 +264,24 @@ async fn platform_tool_remote_bytes_and_header_redaction_survive_bundle_export()
         ),
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let web = stravia_web_access::LocalWeb::new(stravia_web_access::OutboundProxyMode::Direct)?;
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri(&url)
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let request = client
+        .post(&url)
         .header("Authorization", "Bearer request-header-secret")
-        .body(request_body.to_vec())?;
-    let (response, body) =
-        scope::scope(Some(run.clone()), web.http_client().fetch(request.into())).await?;
-    assert_eq!(response.status().as_u16(), 503);
+        .body(request_body.to_vec());
+    let (response, body) = scope::scope(Some(run.clone()), async {
+        let (response, exchange) = stravia_web_access::wire::send(
+            request,
+            stravia_runtime_contract::wire_debug::current(),
+            "web-access/http",
+        )
+        .await?;
+        let status = response.status();
+        let body = stravia_web_access::wire::body(response, exchange).await?;
+        Ok::<_, reqwest::Error>((status, body))
+    })
+    .await?;
+    assert_eq!(response.as_u16(), 503);
     assert_eq!(body, response_body);
     finish(&run, "completed", Some("platform-generation"));
     let ticket = ticket(&observation).await?;

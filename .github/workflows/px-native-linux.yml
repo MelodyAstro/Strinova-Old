@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tools_only:
-        description: Warm or verify compiled tools without rebuilding the server
+        description: Build and verify vendor components without rebuilding the server
         type: boolean
         default: false
   push:
@@ -41,7 +41,7 @@ jobs:
   build:
     name: Test and build native GNU package
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     services:
       postgres:
         image: postgres:16
@@ -131,33 +131,11 @@ jobs:
           cache-bin: 'true'
           save-if: 'false'
 
-      # Reuse the exact backend-source cache verified by Platform Plugins.
-      # Cargo still validates the feature/profile graph before reusing outputs.
-      - name: Cache platform workspace compilation
-        id: workspace-cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: strinova-platform-workspace-v075
-          cache-targets: 'true'
-          cache-all-crates: 'true'
-          cache-workspace-crates: 'true'
-          cache-on-failure: 'true'
-          cache-bin: 'true'
-
       - name: Restore pinned compiled patch manager
         uses: actions/cache/restore@v5
         with:
           path: ~/.cargo/bin/cargo-patch-crate
           key: patch-crate-0.1.13-${{ runner.os }}-${{ runner.arch }}-rust-1.99.1
-
-      - name: Restore evolving compiled workspace
-        id: evolving-workspace
-        uses: actions/cache/restore@v5
-        with:
-          key: strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ github.sha }}
-          restore-keys: |
-            strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
-          path: target
 
       - name: Set up pinned Bun
         uses: oven-sh/setup-bun@v2
@@ -169,57 +147,21 @@ jobs:
         with:
           version: '3.52.0'
 
-      - name: Restore compiled tools and vendor components
-        id: compiled-tools
-        uses: actions/cache/restore@v5
-        with:
-          # Test-only edits reuse deployable guests; current native tests still run below.
-          key: px-tools-v1-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('.github/workflows/px-native-linux.yml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'patches/**', '.cargo/config.toml', 'backend/crates/stravia-vendor-*/**', 'backend/crates/stravia-runtime-contract/**', 'backend/crates/stravia-protocol-codec/**', 'backend/crates/stravia-core/assets/providers.stravia.json', 'frontend/stravia-webui/src/assets/icons/*.svg', 'px/ops/ci-tools-cache.py', '!backend/crates/stravia-vendor-*/tests/**') }}
-          path: |
-            target/debug/stravia-build-vendors
-            target/vendor-plugins
-            target/wasm32-wasip2/release/stravia_vendor_codex.wasm
-            target/wasm32-wasip2/release/stravia_vendor_antigravity.wasm
-            target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm
-            target/px-tools-cache.json
-
       - name: Prepare patched upstream dependencies
         run: task prepare:crates
-
-      - name: Verify cached binaries
-        if: steps.compiled-tools.outputs.cache-hit == 'true'
-        run: python3 px/ops/ci-tools-cache.py verify
 
       - name: Build WebUI
         if: inputs.tools_only != true
         run: task build:web
 
       - name: Build embedded provider and its build tool
-        if: steps.compiled-tools.outputs.cache-hit != 'true'
         run: task build:vendors
 
       - name: Build managed compatibility components
-        if: steps.compiled-tools.outputs.cache-hit != 'true'
         run: cargo build --locked --release --lib --target wasm32-wasip2 -p stravia-vendor-codex -p stravia-vendor-antigravity -p stravia-vendor-claudecode
 
       - name: Record compiled binary checksums
-        if: steps.compiled-tools.outputs.cache-hit != 'true'
         run: python3 px/ops/ci-tools-cache.py record
-
-      # Save successful compilation before running tests. A later test failure
-      # must not force compilation of the same tools again; tests always rerun.
-      - name: Save compiled tools and vendor components
-        if: steps.compiled-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          key: ${{ steps.compiled-tools.outputs.cache-primary-key }}
-          path: |
-            target/debug/stravia-build-vendors
-            target/vendor-plugins
-            target/wasm32-wasip2/release/stravia_vendor_codex.wasm
-            target/wasm32-wasip2/release/stravia_vendor_antigravity.wasm
-            target/wasm32-wasip2/release/stravia_vendor_claudecode.wasm
-            target/px-tools-cache.json
 
       - name: Build installable platform plugin example
         if: inputs.tools_only != true
@@ -256,6 +198,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib custom_tool -- --test-threads=1
           cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib request_models -- --test-threads=1
+          cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib policy::tests -- --test-threads=1
           cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib platform_plugins -- --test-threads=1
           cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib account_usage -- --test-threads=1
           cargo test --locked --release --config profile.release.package.stravia-core.opt-level=0 --config profile.release.package.stravia-core.codegen-units=16 -p stravia-core --lib account_usage_postgres -- --ignored --test-threads=1
@@ -308,19 +251,30 @@ jobs:
       - name: Verify compiled-tool cache checkpoint
         run: python3 px/ops/ci-tools-cache.py verify
 
-      - name: Upload native package
+      - name: Prepare public release assets and encrypt the deployment bundle
+        if: inputs.tools_only != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 px/ops/publish-native-release.py --artifact-dir dist/px-native --output-dir dist/public
+          tar -C dist/px-native -cf - . | gpg --batch --compress-algo none --encrypt \
+            --recipient-file .github/strinova-artifact-recipient.asc --output dist/native.tar.gpg
+
+      - name: Upload encrypted native package
         if: inputs.tools_only != true
         uses: actions/upload-artifact@v4
         with:
           name: strinova-linux-x86_64-gnu-${{ github.sha }}
-          path: dist/px-native/*
+          path: dist/native.tar.gpg
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
 
-      - name: Save compiled workspace after checks or failure
-        if: always() && steps.evolving-workspace.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+      - name: Upload verified public release assets
+        if: inputs.tools_only != true
+        uses: actions/upload-artifact@v4
         with:
-          key: strinova-compiled-v075-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ github.sha }}
-          path: target
+          name: strinova-public-${{ github.sha }}
+          path: dist/public/*
+          if-no-files-found: error
+          retention-days: 14

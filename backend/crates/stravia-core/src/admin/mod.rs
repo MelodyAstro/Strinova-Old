@@ -15,7 +15,6 @@ use crate::db::models::*;
 
 mod api_keys;
 mod auth_data;
-pub(crate) mod browser;
 mod credential_masking;
 mod credential_protection;
 mod extensions;
@@ -25,6 +24,7 @@ mod media_generation;
 mod model_data;
 mod money;
 mod oauth;
+mod platform_llm;
 pub(crate) use oauth::runtime::{OAuthRefreshRuntime, provider_oauth_needs_refresh};
 mod observability;
 mod observation_masking;
@@ -56,7 +56,6 @@ pub use crate::interaction_observation::{
     UpstreamErrorDetail, UpstreamErrorPage, UpstreamErrorQuery, UpstreamErrorSummary,
     UsageCoverage,
 };
-pub use browser::{BrowserSettings, BrowserSettingsUpdate, BrowserSource};
 pub use money::{ProviderCostPlanInput, provider_cost_plan_value};
 pub use provider_connection::{
     ProviderConfigurationPreview, ProviderConfigurationPreviewInput, ProviderConnectionCheckInput,

@@ -7,6 +7,7 @@ pub(super) async fn configure_gateway_extensions(
     gateway: &mut Gateway,
     mut hooks: Vec<Arc<dyn Hook>>,
     mut tools: Vec<Arc<dyn PlatformTool>>,
+    dynamic_tool_loaders: Vec<Arc<dyn crate::hook::DynamicPlatformToolLoader>>,
     mut mcp_tools: Vec<Arc<dyn McpTool>>,
     mut agent_definitions: Vec<stravia_runtime_contract::agent::AgentDefinitionSpec>,
 ) -> anyhow::Result<()> {
@@ -162,7 +163,8 @@ pub(super) async fn configure_gateway_extensions(
     hooks.push(crate::media_generation::platform::hook(generate.clone()));
     tools.push(Arc::new(generate.clone()));
     mcp_tools.push(Arc::new(generate));
-    let (hook_runtime, read_tool) = hook_runtime_with_web_search(gateway, hooks, tools)?;
+    let (hook_runtime, read_tool) =
+        hook_runtime_with_web_search(gateway, hooks, tools, dynamic_tool_loaders)?;
     gateway.hook_runtime = hook_runtime;
     mcp_tools.push(Arc::new(read_tool));
     gateway.mcp_registry = McpToolRegistry::new(mcp_tools)?;
@@ -186,6 +188,22 @@ impl stravia_web_search::SearchRunAuthorizer for GatewayWebSearchAuthorizer {
         principal: &stravia_runtime_contract::Principal,
         binding: &stravia_web_search::ResolvedWebSearchBackend,
     ) -> Result<(), stravia_web_search::WebSearchError> {
+        if let Err(denial) = self
+            .gateway
+            .policy_allows_capability(
+                principal.api_key_id(),
+                crate::policy::PolicyCapability::WebSearch,
+            )
+            .await
+        {
+            tracing::warn!(
+                api_key_id = ?principal.api_key_id(),
+                code = denial.code.as_str(),
+                reason = denial.message.as_str(),
+                "policy denied web search capability"
+            );
+            return Err(web_search_authorization_error());
+        }
         proxy::security::Security::new(self.gateway.storage.auth())
             .authorize_principal_capability(principal)
             .await
@@ -305,6 +323,7 @@ fn hook_runtime_with_web_search(
     gateway: &Gateway,
     mut hooks: Vec<Arc<dyn Hook>>,
     mut tools: Vec<Arc<dyn PlatformTool>>,
+    dynamic_tool_loaders: Vec<Arc<dyn crate::hook::DynamicPlatformToolLoader>>,
 ) -> anyhow::Result<(HookRuntime, crate::mcp::read::ReadTool)> {
     let (builtin_hooks, builtin_tools) = stravia_web_search::builtin_extensions(Arc::new(
         web_search::host::SearchHost(gateway.clone()),
@@ -330,5 +349,7 @@ fn hook_runtime_with_web_search(
         }
     }
     let tool_registry = PlatformToolRegistry::new(tools).map_err(anyhow::Error::new)?;
-    Ok((HookRuntime::with_tools(hooks, tool_registry), read_tool))
+    let runtime = HookRuntime::with_tools(hooks, tool_registry)
+        .with_dynamic_tool_loaders(dynamic_tool_loaders);
+    Ok((runtime, read_tool))
 }

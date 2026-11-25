@@ -124,14 +124,18 @@ async fn ensure_sqlite_foreign_keys(
 }
 
 fn sqlite_migration_keeps_foreign_keys(migration: &sqlx::migrate::Migration) -> bool {
-    // 重建表及其数据转换（2、7、8、12、24、32、33）仍需 FK-off 和完整审计。
+    // 重建表及其数据转换（2、7、8、12、24、32、33、37、38、40）仍需 FK-off 和完整审计。
+    // 46、47、48 仅新增表、列与索引，不删除或重建父表，始终保持外键约束开启。
     // 52 只重建没有入站外键的 vendor_plugins，其余为新表，FK 保持开启即可。
+    // 54 只重建没有入站外键的 model_backends 以调整首输出空闲窗口默认值，FK 保持开启即可。
     // 56 仅增加可空 cursor 元数据列，不回填数据，也不改动外键。
     // 57 修改 Route 列并克隆受引用的配置，始终保持外键约束开启。
+    // 58 重建无入站外键的 web_providers（local_engines 泛化为 config_json）并清理已移除种子设置，保持外键约束开启。
+    // 59 原地改写 model_backends.thinking_level_map JSON 列中的旧思考控制类型，不修改表结构与外键。
     // 新迁移须审查后显式登记；未知 SQL 不凭版本号继承已审核 SQL 的检查策略。
     if !matches!(
         migration.version,
-        1 | 3..=6 | 9..=11 | 13..=23 | 25..=31 | 34..=36 | 39 | 41..=45 | 49..=53 | 55..=57
+        1 | 3..=6 | 9..=11 | 13..=23 | 25..=31 | 34..=36 | 39 | 41..=59
     ) {
         return false;
     }
@@ -223,7 +227,7 @@ pub async fn run_sqlite_migrator(
             .execute(pinned.connection())
             .await?;
     }
-    if runner.version_exists(7) {
+    if runner.version_exists(7) && last_applied < 33 {
         report("history_schema", "Preparing history schema", 0, None);
         runner
             .run_direct(Some(6), pinned.connection(), false)
@@ -234,7 +238,7 @@ pub async fn run_sqlite_migrator(
         report("history_data", "Checking history conversion", 0, None);
         crate::turn_chain::upgrade::convert_history_sqlite(pinned.connection()).await?;
     }
-    if runner.version_exists(8) {
+    if runner.version_exists(8) && last_applied < 42 {
         report("debug_manifests", "Checking diagnostic manifests", 0, None);
         crate::interaction_observation::upgrade::export_debug_manifests_sqlite(
             pinned.connection(),
@@ -282,7 +286,7 @@ pub async fn run_sqlite_migrator(
         )
         .await?;
     }
-    if runner.version_exists(30) {
+    if runner.version_exists(30) && last_applied < 31 {
         runner
             .run_direct(Some(30), pinned.connection(), false)
             .await?;
@@ -294,7 +298,7 @@ pub async fn run_sqlite_migrator(
         );
         crate::provider_models::pinning_migration::run_sqlite(pinned.connection()).await?;
     }
-    if runner.version_exists(32) {
+    if runner.version_exists(32) && last_applied < 33 {
         runner
             .run_direct(Some(32), pinned.connection(), false)
             .await?;
@@ -308,7 +312,7 @@ pub async fn run_sqlite_migrator(
             crate::turn_chain::upgrade::normalize_sqlite(pinned.connection()).await?;
         }
     }
-    if runner.version_exists(35) {
+    if runner.version_exists(35) && last_applied < 35 {
         // 先应用凭据迁移之前的 schema，清理才能依赖已存在的观察与映射表。
         runner
             .run_direct(Some(34), pinned.connection(), false)
@@ -331,7 +335,7 @@ pub async fn run_sqlite_migrator(
             .await?;
         }
     }
-    if runner.version_exists(37) {
+    if runner.version_exists(37) && last_applied < 38 {
         runner
             .run_direct(Some(37), pinned.connection(), false)
             .await?;
@@ -350,7 +354,7 @@ pub async fn run_sqlite_migrator(
             crate::content_upgrade::run_sqlite(pinned.connection()).await?;
         }
     }
-    if runner.version_exists(39) {
+    if runner.version_exists(39) && last_applied < 40 {
         // 0039 只新增列与引用表；回填读取旧 expires_at，0040 才移除它并收紧约束。
         runner
             .run_direct(Some(39), pinned.connection(), false)
@@ -365,7 +369,7 @@ pub async fn run_sqlite_migrator(
             crate::turn_chain::upgrade::retention_sqlite(pinned.connection()).await?;
         }
     }
-    if runner.version_exists(41) {
+    if runner.version_exists(41) && last_applied < 42 {
         report(
             "observation_schema",
             "Preparing normalized observation schema",
@@ -393,7 +397,7 @@ pub async fn run_sqlite_migrator(
             .await?;
         }
     }
-    if runner.version_exists(53) {
+    if runner.version_exists(53) && last_applied < 53 {
         runner
             .run_direct(Some(52), pinned.connection(), false)
             .await?;
@@ -413,7 +417,7 @@ pub async fn run_sqlite_migrator(
             }
         }
     }
-    if runner.version_exists(55) {
+    if runner.version_exists(55) && last_applied < 55 {
         runner
             .run_direct(Some(54), pinned.connection(), false)
             .await?;
@@ -513,14 +517,14 @@ pub async fn run_postgres_migrator(
         );
         return Ok(());
     }
-    if runner.version_exists(7) {
+    if runner.version_exists(7) && last_applied < 33 {
         report("history_schema", "Preparing history schema", 0, None);
         runner.run_direct(Some(6), &mut *connection, false).await?;
         runner.run_direct(Some(7), &mut *connection, false).await?;
         report("history_data", "Checking history conversion", 0, None);
         crate::turn_chain::upgrade::convert_history_postgres(&mut connection).await?;
     }
-    if runner.version_exists(8) {
+    if runner.version_exists(8) && last_applied < 42 {
         report("debug_manifests", "Checking diagnostic manifests", 0, None);
         crate::interaction_observation::upgrade::export_debug_manifests_postgres(
             &mut connection,
@@ -564,7 +568,7 @@ pub async fn run_postgres_migrator(
         )
         .await?;
     }
-    if runner.version_exists(30) {
+    if runner.version_exists(30) && last_applied < 31 {
         runner.run_direct(Some(30), &mut *connection, false).await?;
         report(
             "model_pinning",
@@ -574,7 +578,7 @@ pub async fn run_postgres_migrator(
         );
         crate::provider_models::pinning_migration::run_postgres(&mut connection).await?;
     }
-    if runner.version_exists(32) {
+    if runner.version_exists(32) && last_applied < 33 {
         runner.run_direct(Some(32), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=33 AND success)",
@@ -586,7 +590,7 @@ pub async fn run_postgres_migrator(
             crate::turn_chain::upgrade::normalize_postgres(&mut connection).await?;
         }
     }
-    if runner.version_exists(35) {
+    if runner.version_exists(35) && last_applied < 35 {
         // 先应用凭据迁移之前的 schema，清理才能依赖已存在的观察与映射表。
         runner.run_direct(Some(34), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
@@ -607,7 +611,7 @@ pub async fn run_postgres_migrator(
             .await?;
         }
     }
-    if runner.version_exists(37) {
+    if runner.version_exists(37) && last_applied < 38 {
         runner.run_direct(Some(37), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=38 AND success)",
@@ -624,7 +628,7 @@ pub async fn run_postgres_migrator(
             crate::content_upgrade::run_postgres(&mut connection).await?;
         }
     }
-    if runner.version_exists(39) {
+    if runner.version_exists(39) && last_applied < 40 {
         // 0039 只新增列与引用表；回填读取旧 expires_at，0040 才移除它并收紧约束。
         runner.run_direct(Some(39), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
@@ -637,7 +641,7 @@ pub async fn run_postgres_migrator(
             crate::turn_chain::upgrade::retention_postgres(&mut connection).await?;
         }
     }
-    if runner.version_exists(41) {
+    if runner.version_exists(41) && last_applied < 42 {
         report(
             "observation_schema",
             "Preparing normalized observation schema",
@@ -661,7 +665,7 @@ pub async fn run_postgres_migrator(
                 .await?;
         }
     }
-    if runner.version_exists(53) {
+    if runner.version_exists(53) && last_applied < 53 {
         runner.run_direct(Some(52), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=53 AND success)",
@@ -672,7 +676,7 @@ pub async fn run_postgres_migrator(
             crate::credential_mapping_upgrade::run_postgres(&mut connection).await?;
         }
     }
-    if runner.version_exists(55) {
+    if runner.version_exists(55) && last_applied < 55 {
         runner.run_direct(Some(54), &mut *connection, false).await?;
         let finalized: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=55 AND success)",
@@ -1654,14 +1658,8 @@ mod tests {
                 .bind(bits & 1 != 0)
                 .execute(&pool).await.unwrap();
         }
-        let error = migrate_sqlite(&pool, None)
-            .await
-            .expect_err("migration must reject existing foreign key violations");
-        assert!(
-            error
-                .to_string()
-                .contains("database already has foreign key violations")
-        );
+        // 49..=59 全部保持外键开启，增量升级不扫描无关历史表的既有孤儿，但新写入仍强制校验外键。
+        migrate_sqlite(&pool, None).await.unwrap();
         let retained: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM provider_models WHERE provider_id = 'missing-provider'",
         )
@@ -1669,11 +1667,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retained, 1);
-        sqlx::query("DELETE FROM provider_models WHERE provider_id = 'missing-provider'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        migrate_sqlite(&pool, None).await.unwrap();
         let error = sqlx::query("INSERT INTO provider_models(provider_id,model_id,source_kind,presence,metadata_json) VALUES ('missing-provider','another-orphan','manual','present','{}')")
             .execute(&pool).await.expect_err("foreign keys remain enforced after migration");
         assert!(
@@ -2061,17 +2054,11 @@ mod tests {
         assert!(!mcp);
         assert_eq!(injections, "[]");
 
-        let (use_proxy, api_key, engines): (bool, Option<String>, String) = sqlx::query_as(
-            "SELECT use_proxy, api_key, local_engines FROM web_providers WHERE id = 'web-provider-local'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("built-in Local Web Provider");
-        assert!(!use_proxy);
-        assert!(api_key.is_none());
-        let engines: serde_json::Value = serde_json::from_str(&engines).unwrap();
-        assert_eq!(engines["google"]["enabled"], true);
-        assert_eq!(engines["google_scholar"]["enabled"], false);
+        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_providers")
+            .fetch_one(&pool)
+            .await
+            .expect("empty fresh web_providers");
+        assert_eq!(provider_count, 0);
         for key in [
             "web_access_search_provider_ids",
             "web_access_fetch_provider_ids",
@@ -2083,15 +2070,109 @@ mod tests {
                 .expect("initial Web Access priority");
             assert_eq!(
                 serde_json::from_str::<Vec<String>>(&value).unwrap(),
-                ["web-provider-local"]
+                Vec::<String>::new()
             );
         }
         assert!(
-            sqlx::query("INSERT INTO web_providers (id, name, kind, api_key) VALUES ('removed', 'Removed', 'tavily', 'secret')")
+            sqlx::query("INSERT INTO web_providers (id, name, kind, api_key) VALUES ('blank', 'Blank', '   ', 'secret')")
                 .execute(&pool)
                 .await
                 .is_err()
         );
+        assert!(
+            sqlx::query("INSERT INTO web_providers (id, name, kind, config_json) VALUES ('bad-cfg', 'BadCfg', 'worker', '[]')")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query(
+            "INSERT INTO web_providers (id, name, kind, config_json) VALUES ('custom-worker', 'Worker', 'worker-web', '{\"endpoint\":\"http://127.0.0.1:9000\"}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("custom registered kind persists with JSON object config");
+    }
+
+    #[tokio::test]
+    async fn sqlite_upgrade_0058_removes_local_seed_and_preserves_custom_providers() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = sqlite_file_pool(directory.path()).await;
+        let prefix = |version| {
+            Migrator::with_migrations(
+                SQLITE_MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= version)
+                    .cloned()
+                    .collect(),
+            )
+        };
+        super::run_sqlite_migrator(&pool, &prefix(57), None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO web_providers (id, name, kind, api_key, use_proxy) VALUES ('existing-exa', 'Existing Exa', 'exa', 'secret-key', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE settings SET value = '[\"web-provider-local\",\"existing-exa\"]' WHERE name = 'web_access_search_provider_ids'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO settings (name, value) VALUES ('web_access_browser_path', '/usr/bin/chromium')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        super::migrate_sqlite(&pool, None).await.unwrap();
+
+        type WebProviderRow = (String, String, Option<String>, bool, Option<String>);
+        let rows: Vec<WebProviderRow> = sqlx::query_as(
+            "SELECT id, kind, api_key, use_proxy, config_json FROM web_providers ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "existing-exa".into(),
+                "exa".into(),
+                Some("secret-key".into()),
+                true,
+                None
+            )]
+        );
+        let search_ids: String = sqlx::query_scalar(
+            "SELECT value FROM settings WHERE name = 'web_access_search_provider_ids'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&search_ids).unwrap(),
+            vec!["existing-exa"]
+        );
+        let fetch_ids: String = sqlx::query_scalar(
+            "SELECT value FROM settings WHERE name = 'web_access_fetch_provider_ids'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&fetch_ids).unwrap(),
+            Vec::<String>::new()
+        );
+        let browser_setting: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE name = 'web_access_browser_path'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(browser_setting.is_none());
     }
 
     #[tokio::test]
@@ -3286,17 +3367,11 @@ mod tests {
             .is_err()
         );
 
-        let (use_proxy, api_key, engines): (bool, Option<String>, serde_json::Value) =
-            sqlx::query_as(
-                "SELECT use_proxy, api_key, local_engines FROM web_providers WHERE id = 'web-provider-local'",
-            )
+        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_providers")
             .fetch_one(&pool)
             .await
-            .expect("built-in Local Web Provider");
-        assert!(!use_proxy);
-        assert!(api_key.is_none());
-        assert_eq!(engines["google"]["enabled"], true);
-        assert_eq!(engines["google_scholar"]["enabled"], false);
+            .expect("empty fresh web_providers");
+        assert_eq!(provider_count, 0);
         for key in [
             "web_access_search_provider_ids",
             "web_access_fetch_provider_ids",
@@ -3308,15 +3383,27 @@ mod tests {
                 .expect("initial Web Access priority");
             assert_eq!(
                 serde_json::from_str::<Vec<String>>(&value).unwrap(),
-                ["web-provider-local"]
+                Vec::<String>::new()
             );
         }
         assert!(
-            sqlx::query("INSERT INTO web_providers (id, name, kind, api_key) VALUES ('removed', 'Removed', 'tavily', 'secret')")
+            sqlx::query("INSERT INTO web_providers (id, name, kind, api_key) VALUES ('blank', 'Blank', '   ', 'secret')")
                 .execute(&pool)
                 .await
                 .is_err()
         );
+        assert!(
+            sqlx::query("INSERT INTO web_providers (id, name, kind, config_json) VALUES ('bad-cfg', 'BadCfg', 'worker', '[]'::jsonb)")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query(
+            "INSERT INTO web_providers (id, name, kind, config_json) VALUES ('custom-worker', 'Worker', 'worker-web', '{\"endpoint\":\"http://127.0.0.1:9000\"}'::jsonb)",
+        )
+        .execute(&pool)
+        .await
+        .expect("custom registered kind persists with JSON object config");
         })
         .await;
         pool.close().await;
@@ -3330,6 +3417,512 @@ mod tests {
                 std::panic::resume_unwind(error.into_panic());
             }
             panic!("migration test task failed: {error}");
+        }
+    }
+
+    fn legacy_0059_fixture_maps() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+        let mixed = serde_json::json!([
+            {"level": "off", "control": {"type": "disabled"}, "source": "generated"},
+            {"level": "minimal", "control": {"type": "budget", "value": 0}, "source": "overridden"},
+            {"level": "low", "control": {"type": "budget", "value": 2048}, "source": "overridden"},
+            {"level": "medium", "control": {"type": "enabled"}, "source": "generated"},
+            {"level": "high", "control": {"type": "effort", "value": "high"}, "source": "overridden"},
+            {"level": "xhigh", "control": {"type": "hidden"}, "source": "generated"},
+            {"level": "max", "control": {"type": "budget", "value": 32768}, "source": "overridden"}
+        ]);
+        let off_enabled = serde_json::json!([
+            {"level": "off", "control": {"type": "enabled"}, "source": "overridden"},
+            {"level": "low", "control": {"type": "budget", "value": 1024}, "source": "generated"}
+        ]);
+        let clean = serde_json::json!([
+            {"level": "off", "control": {"type": "effort", "value": "none"}, "source": "generated"},
+            {"level": "high", "control": {"type": "effort", "value": "high"}, "source": "overridden"},
+            {"level": "max", "control": {"type": "hidden"}, "source": "generated"}
+        ]);
+        (mixed, off_enabled, clean)
+    }
+
+    fn assert_0059_migrated_maps(
+        mixed: &serde_json::Value,
+        off_enabled: &serde_json::Value,
+        clean: &serde_json::Value,
+        empty: &serde_json::Value,
+    ) {
+        use crate::thinking::{ThinkingLevelMapping, ThinkingMappingSource};
+        use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+
+        let expected_mixed = vec![
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Off,
+                control: TargetThinkingControl::Effort {
+                    value: "none".into(),
+                },
+                source: ThinkingMappingSource::Generated,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Minimal,
+                control: TargetThinkingControl::Effort {
+                    value: "none".into(),
+                },
+                source: ThinkingMappingSource::Overridden,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Low,
+                control: TargetThinkingControl::Effort {
+                    value: "low".into(),
+                },
+                source: ThinkingMappingSource::Overridden,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Medium,
+                control: TargetThinkingControl::Effort {
+                    value: "medium".into(),
+                },
+                source: ThinkingMappingSource::Generated,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::High,
+                control: TargetThinkingControl::Effort {
+                    value: "high".into(),
+                },
+                source: ThinkingMappingSource::Overridden,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Xhigh,
+                control: TargetThinkingControl::Hidden,
+                source: ThinkingMappingSource::Generated,
+            },
+            ThinkingLevelMapping {
+                level: ThinkingLevel::Max,
+                control: TargetThinkingControl::Effort {
+                    value: "max".into(),
+                },
+                source: ThinkingMappingSource::Overridden,
+            },
+        ];
+        let parsed_mixed: Vec<ThinkingLevelMapping> =
+            serde_json::from_value(mixed.clone()).expect("mixed map deserializes cleanly");
+        assert_eq!(parsed_mixed, expected_mixed);
+
+        let parsed_off_enabled: Vec<ThinkingLevelMapping> =
+            serde_json::from_value(off_enabled.clone()).expect("off_enabled map deserializes");
+        assert_eq!(
+            parsed_off_enabled,
+            vec![
+                ThinkingLevelMapping {
+                    level: ThinkingLevel::Off,
+                    control: TargetThinkingControl::Effort {
+                        value: "none".into(),
+                    },
+                    source: ThinkingMappingSource::Overridden,
+                },
+                ThinkingLevelMapping {
+                    level: ThinkingLevel::Low,
+                    control: TargetThinkingControl::Effort {
+                        value: "low".into(),
+                    },
+                    source: ThinkingMappingSource::Generated,
+                },
+            ]
+        );
+
+        let parsed_clean: Vec<ThinkingLevelMapping> =
+            serde_json::from_value(clean.clone()).expect("clean map deserializes");
+        assert_eq!(parsed_clean.len(), 3);
+        assert_eq!(
+            parsed_clean[0].control,
+            TargetThinkingControl::Effort {
+                value: "none".into()
+            }
+        );
+        assert_eq!(
+            parsed_clean[1].control,
+            TargetThinkingControl::Effort {
+                value: "high".into()
+            }
+        );
+        assert_eq!(parsed_clean[2].control, TargetThinkingControl::Hidden);
+
+        let parsed_empty: Vec<ThinkingLevelMapping> =
+            serde_json::from_value(empty.clone()).expect("empty array preserved");
+        assert!(parsed_empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_0059_simplifies_thinking_level_map_with_fk_on_and_idempotency() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = sqlite_file_pool(directory.path()).await;
+        let migration_59 = super::SQLITE_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 59)
+            .expect("0059 SQLite migration");
+        assert!(
+            super::sqlite_migration_keeps_foreign_keys(migration_59),
+            "0059 must keep SQLite PRAGMA foreign_keys = ON"
+        );
+
+        let mut to_0058 = super::unlocked_runner(&super::SQLITE_MIGRATOR);
+        to_0058
+            .migrations
+            .to_mut()
+            .retain(|migration| migration.version <= 58);
+        super::run_sqlite_migrator(&pool, &to_0058, None)
+            .await
+            .expect("migrate through 0058");
+
+        sqlx::query(
+            "INSERT INTO providers (id, name, protocol, base_url, api_key) \
+             VALUES ('p-59', 'Provider 59', 'anthropic-messages', 'https://example.invalid', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO models (id, model_id, balance) VALUES ('r-59', 'route-59', 'traffic_equalization')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (mixed, off_enabled, clean) = legacy_0059_fixture_maps();
+        for (id, model, map_json) in [
+            ("t-mixed", "claude-legacy", mixed.to_string()),
+            ("t-off-enabled", "toggle-edge", off_enabled.to_string()),
+            ("t-clean", "already-clean", clean.to_string()),
+            ("t-empty", "empty-map", "[]".to_string()),
+        ] {
+            sqlx::query(
+                "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                 VALUES (?, 'r-59', 'p-59', ?, 0, ?)",
+            )
+            .bind(id)
+            .bind(model)
+            .bind(map_json)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Synthetic load: 500 legacy rows + 500 clean rows to verify bounded migration time.
+        let mut tx = pool.begin_write().await.unwrap();
+        for i in 0..500 {
+            sqlx::query(
+                "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                 VALUES (?, 'r-59', 'p-59', ?, 0, ?)",
+            )
+            .bind(format!("t-bulk-legacy-{i}"))
+            .bind(format!("bulk-legacy-{i}"))
+            .bind(mixed.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                 VALUES (?, 'r-59', 'p-59', ?, 0, ?)",
+            )
+            .bind(format!("t-bulk-clean-{i}"))
+            .bind(format!("bulk-clean-{i}"))
+            .bind(clean.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        migrate_sqlite(&pool, None)
+            .await
+            .expect("upgrade 0058 -> 0059");
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+
+        let load_json = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let raw: String = sqlx::query_scalar(
+                    "SELECT thinking_level_map FROM model_backends WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                serde_json::from_str::<serde_json::Value>(&raw).unwrap()
+            }
+        };
+        assert_0059_migrated_maps(
+            &load_json("t-mixed").await,
+            &load_json("t-off-enabled").await,
+            &load_json("t-clean").await,
+            &load_json("t-empty").await,
+        );
+        let remaining_legacy: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_backends WHERE EXISTS (\
+                SELECT 1 FROM json_each(thinking_level_map) AS je \
+                WHERE json_extract(je.value, '$.control.type') IN ('disabled', 'enabled', 'budget')\
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_legacy, 0);
+
+        // Idempotent fast-path re-run: already at 0059 and direct SQL re-execution matches 0 rows.
+        migrate_sqlite(&pool, None)
+            .await
+            .expect("idempotent re-run at 0059");
+        let rerun = sqlx::query(include_str!(
+            "../migrations/sqlite/0059_simplify_thinking_level_map.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("re-executing 0059 SQL must be a no-op fast path");
+        assert_eq!(rerun.rows_affected(), 0);
+        assert_0059_migrated_maps(
+            &load_json("t-mixed").await,
+            &load_json("t-off-enabled").await,
+            &load_json("t-clean").await,
+            &load_json("t-empty").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_0059_simplifies_thinking_level_map_when_configured() {
+        let Some(url) = std::env::var("DB_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let database = format!("stravia_0059_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{database}\" WITH TEMPLATE template0 ENCODING 'UTF8'"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create isolated 0059 migration test database");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.database(&database))
+            .await
+            .expect("connect isolated 0059 migration test database");
+        let scenario_pool = pool.clone();
+        let result = tokio::spawn(async move {
+            let pool = scenario_pool;
+            let mut to_0058 = super::unlocked_runner(&super::POSTGRES_MIGRATOR);
+            to_0058
+                .migrations
+                .to_mut()
+                .retain(|migration| migration.version <= 58);
+            super::run_postgres_migrator(&pool, &to_0058, None)
+                .await
+                .expect("migrate Postgres through 0058");
+
+            sqlx::query(
+                "INSERT INTO providers (id, name, protocol, base_url, api_key) \
+                 VALUES ('p-59', 'Provider 59', 'anthropic-messages', 'https://example.invalid', '')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO models (id, model_id, balance) VALUES ('r-59', 'route-59', 'traffic_equalization')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let (mixed, off_enabled, clean) = legacy_0059_fixture_maps();
+            for (id, model, map_json) in [
+                ("t-mixed", "claude-legacy", mixed.clone()),
+                ("t-off-enabled", "toggle-edge", off_enabled.clone()),
+                ("t-clean", "already-clean", clean.clone()),
+                ("t-empty", "empty-map", serde_json::json!([])),
+            ] {
+                sqlx::query(
+                    "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                     VALUES ($1, 'r-59', 'p-59', $2, 0, $3)",
+                )
+                .bind(id)
+                .bind(model)
+                .bind(sqlx::types::Json(&map_json))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let mut tx = pool.begin().await.unwrap();
+            for i in 0..500 {
+                sqlx::query(
+                    "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                     VALUES ($1, 'r-59', 'p-59', $2, 0, $3)",
+                )
+                .bind(format!("t-bulk-legacy-{i}"))
+                .bind(format!("bulk-legacy-{i}"))
+                .bind(sqlx::types::Json(&mixed))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO model_backends (id, model_id, provider_id, model, priority, thinking_level_map) \
+                     VALUES ($1, 'r-59', 'p-59', $2, 0, $3)",
+                )
+                .bind(format!("t-bulk-clean-{i}"))
+                .bind(format!("bulk-clean-{i}"))
+                .bind(sqlx::types::Json(&clean))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+
+            migrate_postgres(&pool, None)
+                .await
+                .expect("upgrade Postgres 0058 -> 0059");
+
+            let rerun = sqlx::query(include_str!(
+                "../migrations/postgres/0059_simplify_thinking_level_map.sql"
+            ))
+            .execute(&pool)
+            .await
+            .expect("re-executing Postgres 0059 SQL must be a no-op fast path");
+            assert_eq!(rerun.rows_affected(), 0);
+
+            let load_json = |id: &'static str| {
+                let pool = pool.clone();
+                async move {
+                    let row: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(
+                        "SELECT thinking_level_map FROM model_backends WHERE id = $1",
+                    )
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    row.0
+                }
+            };
+            assert_0059_migrated_maps(
+                &load_json("t-mixed").await,
+                &load_json("t-off-enabled").await,
+                &load_json("t-clean").await,
+                &load_json("t-empty").await,
+            );
+            let remaining_legacy: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM model_backends WHERE EXISTS (\
+                    SELECT 1 FROM jsonb_array_elements(thinking_level_map) AS elem \
+                    WHERE elem -> 'control' ->> 'type' IN ('disabled', 'enabled', 'budget')\
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(remaining_legacy, 0);
+
+            migrate_postgres(&pool, None)
+                .await
+                .expect("idempotent Postgres re-run at 0059");
+            assert_0059_migrated_maps(
+                &load_json("t-mixed").await,
+                &load_json("t-off-enabled").await,
+                &load_json("t-clean").await,
+                &load_json("t-empty").await,
+            );
+        })
+        .await;
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE \"{database}\"")))
+            .execute(&admin)
+            .await
+            .expect("drop isolated 0059 migration test database");
+        admin.close().await;
+        if let Err(error) = result {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            panic!("0059 Postgres migration test panicked: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_incremental_upgrades_from_v45_v52_and_v57_skip_full_fk_audit_and_historical_phases()
+     {
+        let prefix = |version| {
+            Migrator::with_migrations(
+                SQLITE_MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= version)
+                    .cloned()
+                    .collect(),
+            )
+        };
+        for (from, to) in [(45, 48), (52, 59), (57, 59)] {
+            let directory = tempfile::tempdir().unwrap();
+            let pool = sqlite_file_pool(directory.path()).await;
+            super::run_sqlite_migrator(&pool, &prefix(from), None)
+                .await
+                .unwrap();
+            // 既有无关孤儿会被全库 PRAGMA foreign_key_check 拒绝；白名单增量升级必须跳过全库扫描。
+            sqlx::raw_sql(
+                "PRAGMA foreign_keys=OFF;
+                 INSERT INTO provider_models(provider_id,model_id,source_kind,presence,metadata_json)
+                 VALUES ('missing-provider','orphan','manual','present','{}');
+                 PRAGMA foreign_keys=ON;",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = events.clone();
+            crate::startup_progress::observe_startup(
+                move |event| observed.lock().unwrap().push(event.phase),
+                super::run_sqlite_migrator(&pool, &prefix(to), None),
+            )
+            .await
+            .expect("whitelisted incremental upgrades must skip full-database foreign key audits");
+
+            let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(fk, 1);
+            let error = sqlx::query(
+                "INSERT INTO provider_models(provider_id,model_id,source_kind,presence,metadata_json)
+                 VALUES ('missing-provider','new-orphan','manual','present','{}')",
+            )
+            .execute(&pool)
+            .await
+            .expect_err("foreign key enforcement must remain active");
+            assert!(
+                error
+                    .as_database_error()
+                    .unwrap()
+                    .is_foreign_key_violation()
+            );
+
+            if from == 57 {
+                let phases = events.lock().unwrap();
+                for historical in [
+                    "history_schema",
+                    "history_data",
+                    "debug_manifests",
+                    "observation_schema",
+                    "observation_data",
+                    "model_pinning",
+                    "content_store",
+                    "retention_data",
+                    "credential_expiry",
+                    "credential_cleanup",
+                ] {
+                    assert!(
+                        !phases.contains(&historical),
+                        "v57->v59 must not emit historical phase {historical:?}: {phases:?}"
+                    );
+                }
+            }
+            pool.close().await;
         }
     }
 }

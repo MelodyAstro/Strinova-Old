@@ -229,9 +229,27 @@ impl PreparedGateway {
         &self.runtime.1
     }
 
+    /// 借用已初始化并完成核心迁移的 SQLite 连接池（若当前后端为 SQLite）。
+    pub fn sqlite_pool(&self) -> Option<&SqlitePool> {
+        self.runtime.2.as_ref()
+    }
+
+    /// 借用已初始化并完成核心迁移的 PostgreSQL 连接池（若当前后端为 PostgreSQL）。
+    pub fn postgres_pool(&self) -> Option<&Pool<Postgres>> {
+        self.runtime.3.as_ref()
+    }
+
     /// 使用保留的配置与连接池启动 Gateway；初始化错误原样返回。
     /// 不重新连接、迁移数据库，也不把持久存储当作内存存储装配。
     pub async fn start(self) -> anyhow::Result<Gateway> {
+        self.start_with_extensions(None).await
+    }
+
+    /// 使用保留的配置与连接池启动 Gateway，并注入可选的宿主扩展工厂（如商业版扩展）。
+    pub async fn start_with_extensions(
+        self,
+        extension_factory: Option<Arc<dyn GatewayExtensionFactory>>,
+    ) -> anyhow::Result<Gateway> {
         let (kind, storage, sqlite_pool, postgres_pool) = self.runtime;
         Gateway::from_storage_with_kind(
             self.config,
@@ -240,6 +258,7 @@ impl PreparedGateway {
             sqlite_pool,
             postgres_pool,
             None,
+            extension_factory,
         )
         .await
     }
@@ -299,6 +318,7 @@ impl Gateway {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -316,6 +336,7 @@ impl Gateway {
             None,
             None,
             Some(network),
+            None,
         )
         .await
     }
@@ -327,6 +348,7 @@ impl Gateway {
         sqlite_pool: Option<SqlitePool>,
         postgres_pool: Option<Pool<Postgres>>,
         vendor_network: Option<VendorNetworkConfig>,
+        extension_factory: Option<Arc<dyn GatewayExtensionFactory>>,
     ) -> anyhow::Result<Self> {
         // 注入持久存储时沿用同一连接池，避免历史与插件状态落入两个数据库。
         let sqlite_pool = sqlite_pool.or_else(|| storage.vendor_plugins().sqlite_pool().cloned());
@@ -442,8 +464,9 @@ impl Gateway {
             )
         };
         let history_content = turn_chains.content_gc();
+        let sql_turn_chains = Arc::new(turn_chains);
         let turn_chains: Arc<dyn stravia_runtime_contract::turn_chain::TurnChainStore> =
-            Arc::new(turn_chains);
+            Arc::clone(&sql_turn_chains) as _;
         let history_markers: Arc<dyn history_marker::HistoryMarkerStore> =
             if let Some(pool) = history_sqlite_pool.as_ref() {
                 Arc::new(history_marker::SqlHistoryMarkerStore::sqlite(pool.clone()))
@@ -561,8 +584,8 @@ impl Gateway {
                     .clone(),
             )
         };
-        let generation_chains = generation_chain::GenerationChain::from_turn_chain(
-            Arc::clone(&turn_chains),
+        let generation_chains = generation_chain::GenerationChain::from_sql_turn_chain(
+            Arc::clone(&sql_turn_chains),
             artifact_store.clone(),
             runtime_cache.clone(),
             retention.clone(),
@@ -645,8 +668,6 @@ impl Gateway {
             tracing::warn!(error = ?error, "plugin marketplace official source initialization failed");
         }
         let catalog_base_url = config.catalog_base_url.clone();
-        let (browser_preferences, browser_path) =
-            admin::browser::BrowserPreferences::load(&config.data_dir);
         let custom_currency = storage.money().custom_currency().await?;
         let mut gw = Self {
             config,
@@ -689,6 +710,7 @@ impl Gateway {
             media_understanding: Arc::new(tokio::sync::RwLock::new(None)),
             hook_runtime: HookRuntime::default(),
             mcp_registry: McpToolRegistry::default(),
+            mcp_catalog_provider: Arc::new(crate::mcp::BuiltinMcpCatalogProvider),
             history_markers,
             reasoning_rejections: history_marker::ReasoningRejections::default(),
             redaction,
@@ -697,8 +719,8 @@ impl Gateway {
             compaction,
             model_turn: model_turn::unreachable_executor(),
             web_access_run_snapshots: web_access::WebAccessRunSnapshotStore::default(),
-            browser_path: Arc::new(std::sync::RwLock::new(browser_path)),
-            browser_preferences: Arc::new(browser_preferences),
+            web_provider_registry: Arc::new(stravia_web_access::WebProviderRegistry::new()),
+            policy_resolver: Arc::new(crate::policy::AllowAllPolicyResolver),
             web_search_runner_state: Arc::new(tokio::sync::RwLock::new(None)),
             route_media_mutation: Arc::new(tokio::sync::Mutex::new(())),
             update_service,
@@ -739,8 +761,25 @@ impl Gateway {
             0,
             None,
         );
-        configure_gateway_extensions(&mut gw, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            .await?;
+        let mut ext = extension_factory
+            .as_ref()
+            .map(|factory| factory.build_extensions(&gw.background_clone()))
+            .unwrap_or_default();
+        if let Some(resolver) = ext.policy_resolver.take() {
+            gw.policy_resolver = resolver;
+        }
+        if let Some(provider) = ext.mcp_catalog_provider.take() {
+            gw.mcp_catalog_provider = provider;
+        }
+        configure_gateway_extensions(
+            &mut gw,
+            ext.hooks,
+            ext.platform_tools,
+            ext.dynamic_tool_loaders,
+            ext.mcp_tools,
+            Vec::new(),
+        )
+        .await?;
         // 两类周期任务共用起点，避免各自首次轮询的延迟改变错峰相位。
         let maintenance_started_at = tokio::time::Instant::now();
         gw.start_provider_model_sync(maintenance_started_at).await?;
@@ -1089,13 +1128,9 @@ impl Gateway {
         Ok(())
     }
 
-    /// Change the browser path for this Gateway and its clones; active runs retain their snapshot.
-    /// Does not persist or validate the path. Admin updates use the persistent API instead.
-    pub fn set_browser_path(&self, path: Option<std::path::PathBuf>) {
-        *self
-            .browser_path
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+    /// Registered external Web Provider factories injected via [`GatewayBuilder::web_provider_factory`].
+    pub fn web_provider_registry(&self) -> &stravia_web_access::WebProviderRegistry {
+        self.web_provider_registry.as_ref()
     }
 
     /// ADR-0073 收口：把一条上游凭据拒绝证据按条件写落库。代际已变（凭据

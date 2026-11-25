@@ -6,7 +6,7 @@ Strinova 是基于 Stravia 的可扩展框架，提供支持用户自定义平�
 
 本公开仓库作为 Strinova 的清理后构建基线与插件 SDK 入口，对应上游 Stravia 版本：
 
-- 上游参考：[StraviaPlatform](https://github.com/Stravia-AI/StraviaPlatform)（`v0.7.5`，commit `aa69767523da8010cbbbd306bded13f212ec52e2`）
+- 上游参考：[StraviaPlatform](https://github.com/Stravia-AI/StraviaPlatform)（`v0.7.6`，commit `b9e0171453dc30f46b1febc0657fe409e08b625c`）
 - 上游归属说明：[UPSTREAM-ATTRIBUTION.md](UPSTREAM-ATTRIBUTION.md)
 - English documentation: [README.md](README.md)
 

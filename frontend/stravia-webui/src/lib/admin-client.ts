@@ -8,7 +8,12 @@ import type { UpdateStatus } from '#lib/product-update.js'
 import type {
   ApiKey,
   ApiKeySpend,
+  CapabilitiesResponse,
+  ConversationTitleInput,
+  ConversationTitleResult,
   CustomCurrency,
+  PlatformLlmConfigView,
+  UpdatePlatformLlmConfig,
   NewProviderCostPlan,
   ProviderCostPlan,
   CredentialRuleCatalog,
@@ -85,8 +90,8 @@ import type {
   ProviderConnectionCheckInput,
   ProviderConnectionCheckResult,
   WebAccessSettings,
-  WebAccessBrowserState,
   WebProvider,
+  WebProviderKindDescriptor,
   WebSearchConfigView,
   UpdateWebSearchConfig,
   EligibleSearchModel,
@@ -139,7 +144,7 @@ export interface ArtifactSettings {
   s3: ArtifactS3Settings | null
 }
 
-type HttpMethod = 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT'
+export type HttpMethod = 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT'
 
 function queryString(query: object): string {
   const params = new URLSearchParams()
@@ -158,7 +163,12 @@ function statsPath(path: string, window?: StatsWindow, bucket?: number, filter?:
   return `${path}${queryString({ ...window, bucket, ...ids })}`
 }
 
-async function request<T>(method: HttpMethod, path: string, body?: unknown, retryOnUnauthorized = true): Promise<T> {
+export async function adminRequest<T>(
+  method: HttpMethod,
+  path: string,
+  body?: unknown,
+  retryOnUnauthorized = true,
+): Promise<T> {
   const headers = new Headers()
   if (method !== 'GET') headers.set('X-Stravia-CSRF', '1')
   if (body !== undefined) headers.set('Content-Type', 'application/json')
@@ -169,6 +179,8 @@ async function request<T>(method: HttpMethod, path: string, body?: unknown, retr
   )
   return decodeAdmin<T>(response)
 }
+
+const request = adminRequest
 
 async function uploadWasm<T>(path: string, file: File): Promise<T> {
   const response = await authenticatedFetch(path, {
@@ -391,6 +403,7 @@ export const admin = {
   },
   catalog: { canonicalModels: () => request<CanonicalModelList>('GET', '/catalog/models') },
   webAccess: {
+    kinds: { list: () => request<WebProviderKindDescriptor[]>('GET', '/web-provider-kinds') },
     providers: {
       list: () => request<WebProvider[]>('GET', '/web-providers'),
       create: (input: CreateWebProvider) => request<WebProvider>('POST', '/web-providers', input),
@@ -401,10 +414,6 @@ export const admin = {
     settings: {
       get: () => request<WebAccessSettings>('GET', '/web-access/settings'),
       update: (input: WebAccessSettings) => request<WebAccessSettings>('PUT', '/web-access/settings', input),
-    },
-    browser: {
-      get: () => request<WebAccessBrowserState>('GET', '/web-access/browser'),
-      set: (path: string | null) => request<WebAccessBrowserState>('PUT', '/web-access/browser', { path }),
     },
   },
   webSearch: {
@@ -613,6 +622,25 @@ export const admin = {
     check: (mode: 'automatic' | 'manual') => request<UpdateStatus>('POST', '/updates/check', { mode }),
     skip: (version: string | null) => request<UpdateStatus>('PUT', '/updates/skipped-version', { version }),
   },
+  platformLlm: {
+    get: () => request<PlatformLlmConfigView>('GET', '/platform-llm'),
+    update: (data: UpdatePlatformLlmConfig) => request<PlatformLlmConfigView>('PUT', '/platform-llm', data),
+    generateConversationTitle: (data: ConversationTitleInput) =>
+      request<ConversationTitleResult>('POST', '/platform-llm/conversation-title', data),
+  },
+  capabilities: { get: () => request<CapabilitiesResponse>('GET', '/capabilities') },
+}
+
+export const capabilitiesQueryKey = ['capabilities'] as const
+
+export function capabilitiesQueryOptions() {
+  return { queryKey: capabilitiesQueryKey, queryFn: admin.capabilities.get, staleTime: 60_000, retry: false }
+}
+
+export const platformLlmQueryKey = ['platform-llm-config'] as const
+
+export function platformLlmQueryOptions() {
+  return { queryKey: platformLlmQueryKey, queryFn: admin.platformLlm.get, staleTime: 60_000 }
 }
 
 /** Changing a route can also change which routes can be bound in the advanced settings. */
@@ -622,6 +650,7 @@ export function invalidateRouteCatalogs(client: QueryClient) {
     client.invalidateQueries({ queryKey: ['media-generation-eligible-routes'] }),
     client.invalidateQueries({ queryKey: ['web-search-external-routes'] }),
     client.invalidateQueries({ queryKey: ['web-search-eligible-models'] }),
+    client.invalidateQueries({ queryKey: platformLlmQueryKey }),
   ])
 }
 

@@ -62,6 +62,25 @@ impl GenerateTool {
     }
 
     async fn enabled(&self, principal: &Principal) -> Result<bool, GenerationError> {
+        if let Err(denial) = self
+            .gateway
+            .policy_allows_capability(
+                principal.api_key_id(),
+                crate::policy::PolicyCapability::MediaGeneration,
+            )
+            .await
+        {
+            tracing::warn!(
+                api_key_id = ?principal.api_key_id(),
+                code = denial.code.as_str(),
+                reason = denial.message.as_str(),
+                "policy denied media generation capability"
+            );
+            return Err(GenerationError::new(
+                "authorization_failed",
+                "Principal authorization failed",
+            ));
+        }
         Security::new(self.gateway.storage.auth())
             .authorize_principal_capability(principal)
             .await
@@ -200,6 +219,12 @@ impl McpTool for GenerateTool {
     }
     fn await_cancellation_cleanup(&self) -> bool {
         true
+    }
+    async fn platform_capability_available(&self) -> bool {
+        config::load(&self.gateway)
+            .await
+            .map(|cfg| cfg.enabled)
+            .unwrap_or(false)
     }
     async fn available(&self, context: &McpContext) -> Result<bool, McpToolError> {
         let Some(keys) = self.gateway.storage.api_keys() else {

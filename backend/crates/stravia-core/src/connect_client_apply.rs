@@ -452,40 +452,76 @@ fn plan_zcode(
     )
 }
 
+const DSH_PI_AI_ENTRY_ID: &str = "llm-pi-ai";
+const DSH_PI_AI_PLUGIN_NAME: &str = "@deepseek-ai/dsh-llm-pi-ai";
+
+fn deepseek_harness_reasoning_efforts(
+    model: &ConnectClientModel,
+) -> Option<JsonMap<String, JsonValue>> {
+    let mut efforts = JsonMap::new();
+    let mut has_non_off = false;
+    for level in &model.supported_thinking_levels {
+        if !matches!(
+            level.as_str(),
+            "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            continue;
+        }
+        if level == "off" {
+            // DSH 留空 off 会省略 reasoning.effort，无法覆盖 Route 默认思考等级；
+            // 显式发 "none" 让 Stravia 入站解码为 ThinkingLevel::Off。
+            efforts.insert("off".to_owned(), json!("none"));
+        } else {
+            has_non_off = true;
+            efforts.insert(level.clone(), json!(level));
+        }
+    }
+    has_non_off.then_some(efforts)
+}
+
 fn plan_deepseek_harness(
     input: &ConnectClientApplyInput,
     paths: &ConfigPaths<'_>,
     existing_files: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<ConnectClientApplyPlan, ConnectClientApplyError> {
     let [path, credentials_path] = paths.resolve(
-        ["$DSH_HOME/settings.yaml", "$DSH_HOME/.credentials.yaml"],
+        ["$DSH_HOME/cordis.patch.yml", "$DSH_HOME/.credentials.yaml"],
         |environment| {
             let root = configured_root(environment, "DSH_HOME", ".dsh")?;
-            Ok([root.join("settings.yaml"), root.join(".credentials.yaml")])
+            Ok([
+                root.join("cordis.patch.yml"),
+                root.join(".credentials.yaml"),
+            ])
         },
     )?;
-    let mut document = parse_yaml(&path, existing_files.get(&path))?;
+    let mut patches = parse_yaml_sequence(&path, existing_files.get(&path))?;
     let mut credentials = parse_yaml(&credentials_path, existing_files.get(&credentials_path))?;
     let provider = json!({
         "displayName": "Stravia Gateway",
         "apiKeyEnv": "STRAVIA_API_KEY",
-        "api": "openai-completions",
+        "api": "openai-responses",
         "baseURL": format!("{}/v1", input.host.trim_end_matches('/')),
         "models": input.models.iter().map(|model| {
             let mut value = JsonMap::from_iter([
                 ("id".to_owned(), json!(model.model_id)),
+                ("name".to_owned(), json!(model.display_name)),
                 (
                     "input".to_owned(),
                     json!(input_modalities(model, input.transparent_image_input_enabled)),
                 ),
             ]);
             insert_optional_context(&mut value, model, "contextWindow");
+            if let Some(efforts) = deepseek_harness_reasoning_efforts(model) {
+                value.insert("reasoningEfforts".to_owned(), JsonValue::Object(efforts));
+            }
             JsonValue::Object(value)
         }).collect::<Vec<_>>(),
     });
-    upsert_json_path(
-        &mut document,
-        &["llm-pi-ai", "providers", "stravia"],
+    upsert_cordis_patch_entry(
+        &mut patches,
+        DSH_PI_AI_ENTRY_ID,
+        DSH_PI_AI_PLUGIN_NAME,
+        &["config", "providers", "stravia"],
         provider.clone(),
         &path,
     )?;
@@ -496,11 +532,19 @@ fn plan_deepseek_harness(
         json!(input.api_key),
         &credentials_path,
     )?;
-    let settings_bytes = serialize_yaml(&path, &document)?;
+    let patch_bytes = serialize_yaml(&path, &JsonValue::Array(patches))?;
     let credentials_bytes = serialize_yaml(&credentials_path, &credentials)?;
-    let settings_preview = serialize_yaml(
+    let patch_preview = serialize_yaml(
         &path,
-        &json!({ "llm-pi-ai": { "providers": { "stravia": provider } } }),
+        &json!([{
+            "id": DSH_PI_AI_ENTRY_ID,
+            "name": DSH_PI_AI_PLUGIN_NAME,
+            "config": {
+                "providers": {
+                    "stravia": provider,
+                },
+            },
+        }]),
     )?;
     let credentials_preview = serialize_yaml(
         &credentials_path,
@@ -519,14 +563,14 @@ fn plan_deepseek_harness(
         preview: format!(
             "# {}\n{}\n# {}\n{}",
             paths[0],
-            String::from_utf8(settings_preview).expect("YAML serializer emits UTF-8"),
+            String::from_utf8(patch_preview).expect("YAML serializer emits UTF-8"),
             paths[1],
             String::from_utf8(credentials_preview).expect("YAML serializer emits UTF-8"),
         ),
         files: vec![
             PlannedConnectClientFile {
                 path: paths[0].clone(),
-                bytes: settings_bytes,
+                bytes: patch_bytes,
                 root: root.clone(),
             },
             PlannedConnectClientFile {
@@ -1054,6 +1098,85 @@ fn upsert_json_path(
     })?;
     object.insert((*leaf).to_owned(), value);
     Ok(())
+}
+
+fn upsert_cordis_patch_entry(
+    patches: &mut Vec<JsonValue>,
+    entry_id: &str,
+    plugin_name: &str,
+    config_path: &[&str],
+    value: JsonValue,
+    file_path: &Path,
+) -> Result<(), ConnectClientApplyError> {
+    let target_index = patches.iter().rposition(|entry| {
+        entry.as_object().is_some_and(|object| {
+            object.get("id").and_then(JsonValue::as_str) == Some(entry_id)
+                && !object.contains_key("insert")
+                && object
+                    .get("name")
+                    .is_none_or(|name| name.is_null() || name.as_str() == Some(plugin_name))
+        })
+    });
+    if let Some(index) = target_index {
+        let entry = &mut patches[index];
+        // YAML 空键（如 `config:` 或 `providers:`）解析为 null，合并前视为空映射。
+        let mut cursor = &mut *entry;
+        for key in config_path.iter().take(config_path.len().saturating_sub(1)) {
+            let Some(object) = cursor.as_object_mut() else {
+                break;
+            };
+            if object.get(*key).is_some_and(JsonValue::is_null) {
+                object.insert((*key).to_owned(), JsonValue::Object(JsonMap::new()));
+            }
+            let Some(next) = object.get_mut(*key) else {
+                break;
+            };
+            cursor = next;
+        }
+        upsert_json_path(entry, config_path, value, file_path)
+    } else {
+        let mut entry = json!({
+            "id": entry_id,
+            "name": plugin_name,
+        });
+        upsert_json_path(&mut entry, config_path, value, file_path)?;
+        patches.push(entry);
+        Ok(())
+    }
+}
+
+fn parse_yaml_sequence(
+    path: &Path,
+    existing: Option<&Vec<u8>>,
+) -> Result<Vec<JsonValue>, ConnectClientApplyError> {
+    let Some(bytes) = existing else {
+        return Ok(Vec::new());
+    };
+    let text = std::str::from_utf8(bytes)
+        .map_err(|cause| error("parse_error", cause.to_string(), Some(path)))?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let document = serde_saphyr::from_str::<JsonValue>(text)
+        .map_err(|cause| error("parse_error", cause.to_string(), Some(path)))?;
+    match document {
+        JsonValue::Null => Ok(Vec::new()),
+        JsonValue::Array(items) => {
+            if items.iter().any(|item| !item.is_object()) {
+                return Err(error(
+                    "parse_error",
+                    "Each patch entry must be a YAML mapping",
+                    Some(path),
+                ));
+            }
+            Ok(items)
+        }
+        _ => Err(error(
+            "parse_error",
+            "The global config must contain a YAML sequence",
+            Some(path),
+        )),
+    }
 }
 
 fn parse_yaml(
@@ -2424,8 +2547,8 @@ modelRoles:
             ),
             (
                 ConnectClientId::DeepseekHarness,
-                "settings.yaml",
-                b"defaultModel: other/current\nllm-pi-ai:\n  providers:\n    other:\n      displayName: Other\n"
+                "cordis.patch.yml",
+                b"- id: agent-default-model\n  config:\n    model: other/current\n- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n      other:\n        displayName: Other\n"
                     .as_slice(),
             ),
             (
@@ -2645,5 +2768,148 @@ modelRoles:
             provider["experimental_bearer_token"].as_str(),
             Some(input.api_key.as_str())
         );
+    }
+
+    #[test]
+    fn deepseek_harness_writes_cordis_patch_responses_api_and_reasoning_efforts() {
+        let mut input = standard_input(ConnectClientId::DeepseekHarness);
+        input.models = vec![
+            ConnectClientModel {
+                supported_thinking_levels: vec![
+                    "off".to_owned(),
+                    "minimal".to_owned(),
+                    "low".to_owned(),
+                    "medium".to_owned(),
+                    "high".to_owned(),
+                    "xhigh".to_owned(),
+                    "max".to_owned(),
+                    "custom-unknown".to_owned(),
+                ],
+                ..model("slow", "Slow")
+            },
+            ConnectClientModel {
+                supported_thinking_levels: vec!["off".to_owned()],
+                ..model("off-only", "Off Only")
+            },
+            ConnectClientModel {
+                supported_thinking_levels: vec![],
+                ..model("plain", "Plain")
+            },
+        ];
+
+        let plan = preview_connect_client_apply(&input).expect("DeepSeek Harness preview");
+        assert_eq!(
+            plan.paths,
+            ["$DSH_HOME/cordis.patch.yml", "$DSH_HOME/.credentials.yaml"]
+        );
+        let (patch_yaml, _) = plan
+            .preview
+            .split_once("\n# $DSH_HOME/.credentials.yaml\n")
+            .expect("separate patch and credentials sections");
+        let patch_yaml = patch_yaml
+            .strip_prefix("# $DSH_HOME/cordis.patch.yml\n")
+            .expect("cordis patch header");
+        let patches: serde_json::Value =
+            serde_saphyr::from_str(patch_yaml).expect("DeepSeek Harness patch YAML");
+        let entries = patches.as_array().expect("patch sequence");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "llm-pi-ai");
+        assert_eq!(entries[0]["name"], "@deepseek-ai/dsh-llm-pi-ai");
+
+        let provider = &entries[0]["config"]["providers"]["stravia"];
+        assert_eq!(provider["api"], "openai-responses");
+        assert_eq!(
+            provider["baseURL"],
+            format!("{}/v1", input.host.trim_end_matches('/'))
+        );
+        assert!(
+            provider.get("compat").is_none(),
+            "DSH rejects completions-only compat keys on openai-responses routes"
+        );
+
+        let models = provider["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["id"], "slow");
+        assert_eq!(models[0]["name"], "Slow");
+        assert_eq!(
+            models[0]["reasoningEfforts"],
+            serde_json::json!({
+                "off": "none",
+                "minimal": "minimal",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max",
+            })
+        );
+        assert!(
+            models[1].get("reasoningEfforts").is_none(),
+            "DSH rejects off-only reasoningEfforts"
+        );
+        assert!(
+            models[2].get("reasoningEfforts").is_none(),
+            "DSH rejects empty reasoningEfforts"
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_merges_existing_cordis_patch_entries_and_rejects_non_sequence() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mut environment = environment(temporary.path());
+        let dsh_home = temporary.path().join("dsh");
+        environment.insert("DSH_HOME".to_owned(), dsh_home.display().to_string());
+        let patch_path = dsh_home.join("cordis.patch.yml");
+        let input = standard_input(ConnectClientId::DeepseekHarness);
+
+        let existing = BTreeMap::from([(
+            patch_path.clone(),
+            b"- id: agent-default-model\n  config:\n    model: other/current\n- insert:\n    - id: custom-plugin\n      name: custom-plugin\n- id: llm-pi-ai\n  config:\n    providers:\n      other:\n        displayName: Other\n"
+                .to_vec(),
+        )]);
+        let plan =
+            plan_connect_client_apply(&input, &environment, &existing).expect("merged patch plan");
+        let merged: serde_json::Value =
+            serde_saphyr::from_str(&planned_text(&plan, "cordis.patch.yml"))
+                .expect("merged patch YAML");
+        let entries = merged.as_array().expect("patch sequence");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["config"]["model"], "other/current");
+        assert_eq!(entries[1]["insert"][0]["id"], "custom-plugin");
+        assert_eq!(entries[2]["id"], "llm-pi-ai");
+        assert_eq!(
+            entries[2]["config"]["providers"]["other"]["displayName"],
+            "Other"
+        );
+        assert_eq!(
+            entries[2]["config"]["providers"]["stravia"]["api"],
+            "openai-responses"
+        );
+
+        let null_config =
+            BTreeMap::from([(patch_path.clone(), b"- id: llm-pi-ai\n  config:\n".to_vec())]);
+        let plan = plan_connect_client_apply(&input, &environment, &null_config)
+            .expect("null config entry should merge cleanly");
+        let merged: serde_json::Value =
+            serde_saphyr::from_str(&planned_text(&plan, "cordis.patch.yml"))
+                .expect("null config merged YAML");
+        assert_eq!(
+            merged[0]["config"]["providers"]["stravia"]["api"],
+            "openai-responses"
+        );
+
+        let mapping_existing = BTreeMap::from([(
+            patch_path.clone(),
+            b"llm-pi-ai:\n  providers:\n    other:\n      displayName: Other\n".to_vec(),
+        )]);
+        let err = plan_connect_client_apply(&input, &environment, &mapping_existing)
+            .expect_err("mapping YAML must be rejected for cordis.patch.yml");
+        assert_eq!(err.code, "parse_error");
+        assert_eq!(err.path, Some(patch_path.display().to_string()));
+
+        let scalar_item_existing = BTreeMap::from([(patch_path.clone(), b"- invalid\n".to_vec())]);
+        let err = plan_connect_client_apply(&input, &environment, &scalar_item_existing)
+            .expect_err("non-mapping patch item must be rejected");
+        assert_eq!(err.code, "parse_error");
     }
 }

@@ -82,18 +82,11 @@ function extractNamedStrings(
 }
 
 function thinkingControlKindLabel(kind: string, locale: Locale): string {
-  const options = { locale }
   switch (kind) {
     case 'effort':
-      return m.model_editor_thinking_effort({}, options)
-    case 'budget':
-      return m.model_editor_thinking_budget({}, options)
-    case 'enabled':
-      return m.model_editor_thinking_enabled({}, options)
-    case 'disabled':
-      return m.model_editor_thinking_disabled({}, options)
+      return m.model_editor_thinking_effort({}, { locale })
     case 'hidden':
-      return m.model_editor_thinking_hidden({}, options)
+      return m.model_editor_thinking_hidden({}, { locale })
     default:
       return kind
   }
@@ -218,8 +211,22 @@ export function localizeBackendErrorMessage(error: unknown, locale: Locale = get
       return m.credential_custom_error_not_found({}, options)
     case 'custom_credential_rule_unavailable':
       return m.credential_custom_error_unavailable({}, options)
-    case 'WEB_ACCESS_BROWSER_REQUIRED':
-      return m.web_access_browser_required({}, options)
+    case 'WEB_PROVIDER_UNAVAILABLE': {
+      const detail = (payload.message ?? (raw.startsWith('{') ? '' : raw)).trim()
+      return detail && !/^HTTP \d+$/.test(detail)
+        ? m.backend_error_web_provider_unavailable_reason({ reason: detail }, options)
+        : m.backend_error_web_provider_unavailable({}, options)
+    }
+    case 'WEB_PROVIDER_SINGLETON_CONFLICT': {
+      const kind = extractString(payload.params, 'kind')
+      return kind
+        ? m.backend_error_web_provider_singleton_conflict({ kind }, options)
+        : m.backend_error_web_provider_singleton_conflict_generic({}, options)
+    }
+    case 'WEB_PROVIDER_DELETE_FORBIDDEN':
+      return m.backend_error_web_provider_delete_forbidden({}, options)
+    case 'WEB_PROVIDER_NAME_CONFLICT':
+      return m.backend_error_web_provider_name_conflict({ name }, options)
     case 'PROVIDER_MODEL_INVALID_CHANGES': {
       const detail = extractString(payload.params, 'error')
       return m.backend_error_unknown({ message: detail || payload.message || raw }, options)
@@ -299,22 +306,14 @@ export function localizeBackendErrorMessage(error: unknown, locale: Locale = get
       )
     case 'THINKING_CONTROL_UNREPRESENTABLE': {
       const levels = extractNamedStrings(payload.params, 'levels', 'level')
-      const controls = extractNamedStrings(payload.params, 'controls', 'control')
       const supported = extractStringArray(payload.params, 'supported_controls')
       return m.backend_error_thinking_control_unrepresentable(
         {
           provider_id: extractString(payload.params, 'provider_id'),
           model_id: extractString(payload.params, 'model_id'),
-          levels: formatList(levels, locale) || extractString(payload.params, 'level'),
-          controls:
-            formatList(
-              controls.map((kind) => thinkingControlKindLabel(kind, locale)),
-              locale,
-            ) || (locale === 'zh-CN' ? '当前控制' : 'the current control'),
+          levels: formatList(levels, locale),
           supported: formatList(
-            (supported.length > 0 ? supported : ['effort', 'hidden']).map((kind) =>
-              thinkingControlKindLabel(kind, locale),
-            ),
+            (supported.length ? supported : ['effort', 'hidden']).map((kind) => thinkingControlKindLabel(kind, locale)),
             locale,
           ),
         },

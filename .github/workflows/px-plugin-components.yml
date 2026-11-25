@@ -47,10 +47,10 @@ jobs:
           key: patch-crate-0.1.13-${{ runner.os }}-${{ runner.arch }}-rust-1.99.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          shared-key: strinova-platform-workspace-v075
+          shared-key: strinova-platform-workspace-v076
           cache-all-crates: 'true'
-          cache-workspace-crates: 'true'
-          cache-bin: 'true'
+          cache-targets: 'false'
+          cache-bin: 'false'
       - uses: go-task/setup-task@v2
         with:
           version: '3.52.0'
@@ -65,10 +65,11 @@ jobs:
         run: |
           mkdir plugins
           cp target/wasm32-wasip2/release/{strinova_model_mapping,stravia_vendor_codex,stravia_vendor_claudecode,stravia_vendor_antigravity}.wasm plugins/
-          cd plugins
-          sha256sum *.wasm > SHA256SUMS
+          (cd plugins && sha256sum *.wasm > SHA256SUMS)
+          tar -C plugins -cf - . | gpg --batch --compress-algo none --encrypt \
+            --recipient-file .github/strinova-artifact-recipient.asc --output plugins.tar.gpg
       - uses: actions/upload-artifact@v4
         with:
           name: strinova-plugins-${{ github.sha }}
-          path: plugins/*
+          path: plugins.tar.gpg
           retention-days: 30

@@ -6,7 +6,7 @@ Strinova is an extensible framework for Stravia. It provides a patched server th
 
 This public repository is the clean build base and SDK surface for Strinova, anchored to upstream Stravia:
 
-- Reference upstream: [StraviaPlatform](https://github.com/Stravia-AI/StraviaPlatform) (`v0.7.5`, commit `aa69767523da8010cbbbd306bded13f212ec52e2`)
+- Reference upstream: [StraviaPlatform](https://github.com/Stravia-AI/StraviaPlatform) (`v0.7.6`, commit `b9e0171453dc30f46b1febc0657fe409e08b625c`)
 - Upstream attribution: [UPSTREAM-ATTRIBUTION.md](UPSTREAM-ATTRIBUTION.md)
 - Chinese overview: [README_CN.md](README_CN.md)
 
