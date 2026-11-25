@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/platform-plugins.yml'
+      - '.github/workflows/px-native-linux.yml'
       - 'Taskfile.yml'
       - 'backend/crates/stravia-core/Cargo.toml'
       - 'backend/crates/stravia-core/src/admin/extensions.rs'

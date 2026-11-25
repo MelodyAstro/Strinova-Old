@@ -28,7 +28,7 @@ permissions:
 
 concurrency:
   group: px-native-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_BUILD_JOBS: '2'
@@ -150,9 +150,11 @@ jobs:
       - name: Prepare patched upstream dependencies
         run: task prepare:crates
 
-      - name: Build WebUI
+      - name: Build and type-check WebUI
         if: inputs.tools_only != true
-        run: task build:web
+        run: |
+          task build:web
+          bun run check:web
 
       - name: Build embedded provider and its build tool
         run: task build:vendors
